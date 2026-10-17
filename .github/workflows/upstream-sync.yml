@@ -1,0 +1,496 @@
+name: Upstream Auto Sync
+
+# ============================================================================
+# 自动同步上游 shuaiplus/nodewarden -> 本 fork 的 main（单文件，无外部脚本依赖）
+#
+# 策略（对应需求：上游状态正常时才全量自动更新）：
+#   1. 上游状态门禁（check job 的"上游当前版本健康门禁"步骤，内联 python，约 1-3 秒）：
+#      a. 仓库状态：存在、未归档、未禁用、未改名、默认分支仍是 main
+#         —— 防删库 / 转私有 / 改名 / 换默认分支等破坏性操作
+#      b. 版本状态：上游当前版本的 CI 检查通过才同步
+#         —— 默认跟随 main 每个提交（VERSION_POLICY=any-commit）
+#         —— 检查策略 lenient：仅"非安全扫描"失败才暂停（OSV 等会随漏洞库波动）
+#         —— 想要最严格：CHECK_POLICY=strict（任何检查失败都暂停）
+#      c. 上游历史未被改写（防 force-push）：上次同步点记录在 git notes
+#   2. 合并：优先 fast-forward；有本地提交时走 merge。
+#      绝不用 reset --hard / rebase —— 你的提交永远保留，冲突显式暴露
+#   3. 保护："我的更新设置"所在文件（wrangler.toml / wrangler.kv.toml /
+#      .github/workflows/）与上游冲突时，立即停止并开 Issue 通知，绝不自动覆盖
+#   4. 合并结果本地构建通过才推送（构建不过不推送，坏版本进不了你的 fork）
+#   5. 推送后 Cloudflare Workers Builds 自动重新部署
+#      （D1/R2/KV/Secrets 是 CF 独立资源，不受部署影响）
+#
+# 首次使用：Actions -> Upstream Auto Sync -> Run workflow 手动跑一次验证
+# 频率调整：改下面 cron（UTC 时间）
+#
+# 本地测试：upstream-sync-test.sh 会提取下方 env.GATE_PY 的 python 代码，
+#           用 fixture JSON 驱动跑全部门禁用例（无需网络）。
+# ============================================================================
+
+on:
+  schedule:
+    - cron: "47 16 * * *" # 每天 UTC 16:47（北京时间 00:47 凌晨，GitHub 队列最空）；想改频率见文件头注释
+  workflow_dispatch: # 允许手动触发
+
+permissions:
+  contents: write
+
+concurrency:
+  group: upstream-sync
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPO: shuaiplus/nodewarden
+  UPSTREAM_BRANCH: main
+  FORK_BRANCH: main
+  # "我的更新设置"所在文件：与上游改动冲突时，工作流停止并通知，绝不自动覆盖。
+  # 你的实例设置（JWT_SECRET 等）在 CF 后台，不在仓库里，上游永远碰不到。
+  PROTECTED_FILES: "wrangler.toml wrangler.kv.toml .github/workflows/"
+  # true  = 上游只要改过受保护文件（即使无冲突）也停止，等人工确认后再放行
+  # false = 仅冲突时停止（默认，保证"全量自动更新"）
+  BLOCK_ON_PROTECTED_CHANGE: "false"
+  # ---- 上游版本健康门禁（"上游当前版本正常"的判定）----
+  # any-commit = 跟随上游 main 每个提交（全量自动更新）
+  # release-only = 只同步上游最新正式版（更保守，适合只要稳定版）
+  VERSION_POLICY: "any-commit"
+  # strict  = 上游任何 CI 检查失败都暂停同步
+  # lenient = 仅"非安全扫描"类检查失败才暂停（默认；OSV/Semgrep 等会随漏洞库波动，避免误伤）
+  # off     = 关闭检查门禁（不推荐）
+  CHECK_POLICY: "lenient"
+  # lenient 模式下视为"噪音"不拦截的检查名（逗号分隔，支持 * 通配）
+  IGNORE_CHECK_PATTERNS: "*OSV*,*Semgrep*,*Gitleaks*,*Scorecard*,*CodeQL*,*Dependabot*,*GitGuardian*,*Security*"
+  # 设置后（逗号分隔，支持 * 通配）只要求这些检查通过，其余一律忽略。
+  # 例如：REQUIRE_CHECKS: "Workers Builds*,Cloudflare Pages*"
+  REQUIRE_CHECKS: ""
+  # ---- S1 内容级检查（0 个 API 请求，基于本地 git 数据）----
+  # 场景：上游"代码清了扔个文本文件"——仓库没删、没归档、CI 可能还绿着，
+  #       但内容已被掏空。git ff 对这种正常延续的历史天然放行，必须内容级拦截。
+  # 规则 1：关键文件必须存在于上游新版本（空格分隔）
+  KEY_FILES: "wrangler.toml package.json src/index.ts"
+  # 规则 2：本次更新删除文件数超过该值 -> 暂停
+  MAX_DELETED_FILES: "50"
+  # 规则 3：删除数占上次文件总数比例超过该百分比 -> 暂停
+  MAX_DELETE_PCT: "30"
+  # ---- 门禁判断代码（python3，由 health 步骤以 python3 -c 执行）----
+  # 判定：门1 仓库状态(防删库/改名/归档) -> 门2 候选提交 -> 门3 该提交 CI 检查
+  # 退出码：0=ok 10=skip(暂不同步，非错误) 1=fail(无法判定)
+  # 结果写入 GITHUB_OUTPUT：verdict / reason / candidate_sha / checks
+  # 说明：MOCK_DIR 仅为本地测试注入（从 fixture 读数据），生产环境不设置即走真实 gh api
+  GATE_PY: |
+    import fnmatch, json, os, subprocess, sys
+
+    REPO = os.environ.get("UPSTREAM_REPO") or ""
+    BRANCH = os.environ.get("UPSTREAM_BRANCH") or "main"
+    POLICY = os.environ.get("CHECK_POLICY") or "lenient"
+    VPOLICY = os.environ.get("VERSION_POLICY") or "any-commit"
+    IGNORE = [p.strip() for p in (os.environ.get("IGNORE_CHECK_PATTERNS") or
+              "*OSV*,*Semgrep*,*Gitleaks*,*Scorecard*,*CodeQL*,*Dependabot*,*GitGuardian*,*Security*"
+              ).split(",") if p.strip()]
+    REQUIRE = [p.strip() for p in (os.environ.get("REQUIRE_CHECKS") or "").split(",") if p.strip()]
+    FAILED = {"failure", "error", "cancelled", "timed_out", "action_required", "startup_failure"}
+    MOCK = os.environ.get("MOCK_DIR")
+
+    def api(path):
+        if MOCK:  # 本地测试：按路径规则读 fixture，不走网络
+            for suffix, fname in [("/releases/latest", "release.json"), ("/git/ref/tags/", "tag-ref.json"),
+                                  ("/git/tags/", "tag-obj.json"), ("/check-runs", "checkruns.json"),
+                                  ("/status", "status.json"), ("/commits/", "commit.json")]:
+                if suffix in path:
+                    try:
+                        return json.load(open(os.path.join(MOCK, fname), encoding="utf-8"))
+                    except Exception:
+                        return None
+            try:
+                return json.load(open(os.path.join(MOCK, "repo.json"), encoding="utf-8"))
+            except Exception:
+                return None
+        try:
+            r = subprocess.run(["gh", "api", path], capture_output=True, text=True, timeout=30)
+            return json.loads(r.stdout) if r.returncode == 0 else None
+        except Exception:
+            return None
+
+    def out(verdict, reason="", sha="", warnings="", checks=""):
+        gh_out = os.environ.get("GITHUB_OUTPUT")
+        if gh_out:
+            with open(gh_out, "a", encoding="utf-8") as f:
+                f.write("verdict=%s\nreason=%s\ncandidate_sha=%s\nchecks=%s\n"
+                        % (verdict, reason.replace("\n", " "), sha, checks.replace("\n", " ")))
+        print("verdict=%s | %s" % (verdict, reason))
+        sys.exit({"ok": 0, "skip": 10, "fail": 1}[verdict])
+
+    def hit(name, patterns):
+        n = name.lower()
+        return any(fnmatch.fnmatchcase(n, p.lower()) for p in patterns)
+
+    if not REPO:
+        out("fail", "UPSTREAM_REPO 未设置")
+
+    # ---- 门 1：上游仓库状态（防删库 / 转私有 / 改名 / 归档 / 换默认分支）----
+    repo = api("repos/%s" % REPO)
+    if not isinstance(repo, dict):
+        out("skip", "无法访问上游仓库 %s（已删除 / 转为私有 / 改名 / 网络异常）。未做任何修改，下次运行再试。" % REPO)
+    if (repo.get("full_name") or "").lower() != REPO.lower():
+        out("skip", "上游仓库已改名（当前 full_name=%s）。未做任何修改，请人工确认后更新 UPSTREAM_REPO。" % repo.get("full_name"))
+    if repo.get("archived"):
+        out("skip", "上游仓库已归档（archived，只读）。未做任何修改。")
+    if repo.get("disabled"):
+        out("skip", "上游仓库已被禁用（disabled）。未做任何修改。")
+    if (repo.get("default_branch") or "") != BRANCH:
+        out("skip", "上游默认分支已从 %s 变为 %s。未做任何修改，请人工确认后更新 UPSTREAM_BRANCH。" % (BRANCH, repo.get("default_branch")))
+
+    # ---- 门 2：确定候选提交 ----
+    sha, desc = "", ""
+    if VPOLICY == "release-only":
+        rel = api("repos/%s/releases/latest" % REPO)
+        if not isinstance(rel, dict) or not rel.get("tag_name"):
+            out("skip", "上游没有正式版 Release（VERSION_POLICY=release-only）。未同步。")
+        if rel.get("prerelease"):
+            out("skip", "上游最新 Release 是预发布版（prerelease）。release-only 策略下未同步。")
+        tag = rel.get("tag_name") or ""
+        ref = api("repos/%s/git/ref/tags/%s" % (REPO, tag))
+        if not isinstance(ref, dict) or not (ref.get("object") or {}).get("sha"):
+            out("skip", "无法解析上游 tag %s。未同步。" % tag)
+        obj = ref.get("object") or {}
+        sha = obj.get("sha") or ""
+        if obj.get("type") == "tag":  # annotated tag：再剥一层拿 commit
+            tobj = api("repos/%s/git/tags/%s" % (REPO, sha))
+            if not isinstance(tobj, dict) or not (tobj.get("object") or {}).get("sha"):
+                out("skip", "无法解析 annotated tag %s (%s)。未同步。" % (tag, sha))
+            sha = (tobj.get("object") or {}).get("sha") or ""
+        desc = "最新正式版 %s (%s)" % (tag, sha)
+    else:
+        commit = api("repos/%s/commits/%s" % (REPO, BRANCH))
+        if not isinstance(commit, dict) or not commit.get("sha"):
+            out("skip", "无法读取上游提交 %s@%s（分支已删除 / 历史被清空）。未做任何修改。" % (REPO, BRANCH))
+        sha = commit.get("sha") or ""
+        desc = "%s@%s (%s)" % (REPO, BRANCH, sha)
+
+    if not sha:
+        out("fail", "拿到了空的候选提交 sha（%s）。这不应发生，请检查上游仓库状态。" % desc)
+
+    # ---- 门 3：候选提交的 CI 检查 ----
+    cr = api("repos/%s/commits/%s/check-runs" % (REPO, BRANCH)) or {"check_runs": []}
+    st = api("repos/%s/commits/%s/status" % (REPO, BRANCH)) or {"statuses": []}
+    entries = []  # (name, status, conclusion)
+    for r in (cr.get("check_runs") or []):
+        entries.append((r.get("name") or "(unnamed)", r.get("status") or "", r.get("conclusion") or ""))
+    for s in (st.get("statuses") or []):
+        state = s.get("state") or ""
+        entries.append((s.get("context") or "(unnamed)", "completed" if state != "pending" else "queued", state))
+
+    checks_str = "; ".join("%s=%s" % (n, c if c else "?") for n, s, c in entries)
+
+    warnings, failed, pending, ignored = [], [], [], []
+    for name, status, concl in entries:
+        if REQUIRE and not hit(name, REQUIRE):
+            continue
+        if not REQUIRE and POLICY == "lenient" and hit(name, IGNORE):
+            if concl in FAILED:
+                ignored.append(name)
+            continue
+        if status != "completed" or not concl:
+            pending.append(name)
+        elif concl in ("success", "neutral", "skipped"):
+            if concl == "skipped":
+                warnings.append(name + "=skipped")
+        elif concl in FAILED:
+            failed.append(name)
+        else:
+            warnings.append(name + "=" + str(concl))
+
+    if POLICY == "off":
+        warnings.append("CHECK_POLICY=off：检查门禁已关闭")
+    elif failed:
+        out("skip", "上游当前版本 CI 检查未通过：%s。策略要求正常才同步，本次暂停。" % ", ".join(failed), sha, "; ".join(warnings), checks_str)
+    elif pending:
+        out("skip", "上游当前版本 CI 检查尚未跑完：%s。下次运行再试。" % ", ".join(pending), sha, "; ".join(warnings), checks_str)
+    elif not entries:
+        warnings.append("上游该提交没有任何 CI 检查记录")
+    if ignored:
+        warnings.append("已忽略的安全扫描类失败：" + ", ".join(ignored))
+
+    out("ok", "上游当前版本正常：%s%s" % (desc, ("（警告：" + "; ".join(warnings) + "）") if warnings else ""), sha, "; ".join(warnings), checks_str)
+
+jobs:
+  check:
+    name: 上游状态门禁（仓库健康 / 版本检查 / 历史完整性）
+    runs-on: ubuntu-latest
+    outputs:
+      verdict: ${{ steps.health.outputs.verdict }}
+      reason: ${{ steps.health.outputs.reason }}
+      candidate_sha: ${{ steps.health.outputs.candidate_sha }}
+      checks: ${{ steps.health.outputs.checks }}
+      behind: ${{ steps.git.outputs.behind }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.FORK_BRANCH }}
+          fetch-depth: 0
+
+      - name: 拉取上游（含 tags）
+        run: |
+          git remote add upstream "https://github.com/${{ env.UPSTREAM_REPO }}.git"
+          git fetch --tags upstream "${{ env.UPSTREAM_BRANCH }}"
+
+      # --------------------------------------------------------------------------
+      # 上游当前版本健康门禁（python3 -c 执行 env.GATE_PY，单进程，约 1-3 秒）
+      # --------------------------------------------------------------------------
+      - name: 上游当前版本健康门禁
+        id: health
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -uo pipefail
+          python3 -c "$GATE_PY"
+          RC=$?
+          # 10=暂不同步（skip，非错误，放行让后续步骤按 verdict 跳过）；1=无法判定（真失败）
+          if [ "$RC" -eq 1 ]; then
+            echo "::error::上游状态无法判定：$(sed -n 's/^reason=//p' "$GITHUB_OUTPUT")"
+            exit 1
+          fi
+          exit 0
+
+      - name: git 层门禁（分支可达 / 历史未改写 / 落后量）
+        id: git
+        if: steps.health.outputs.verdict == 'ok'
+        run: |
+          set -euo pipefail
+          CANDIDATE="${{ steps.health.outputs.candidate_sha }}"
+          # 门 1：候选提交可达（防上游删库 / 清空历史）
+          if ! git cat-file -e "${CANDIDATE}^{commit}" 2>/dev/null; then
+            echo "::error::候选提交 $CANDIDATE 不可达。未做任何修改。"
+            exit 1
+          fi
+          # 门 2：上游历史未被改写（防 force-push）。上次同步点记录在 git notes 里
+          git fetch --no-tags origin "refs/notes/upstream-sync:refs/notes/upstream-sync" 2>/dev/null || echo "(首次运行：无历史同步状态)"
+          LAST="$(git notes --ref=upstream-sync show HEAD 2>/dev/null || true)"
+          LAST_SHA="${LAST%% *}"   # notes 格式 "<sha> files=<总数>"，取 sha 部分
+          if [ -n "$LAST_SHA" ] && ! git merge-base --is-ancestor "$LAST_SHA" "$CANDIDATE"; then
+            echo "::error::检测到上游历史被改写（上次同步点 ${LAST_SHA:0:10} 不在当前上游历史中），疑似 force-push。未做任何修改，请人工确认。"
+            exit 1
+          fi
+          # 落后上游多少提交
+          BEHIND="$(git rev-list --count "HEAD..$CANDIDATE")"
+          echo "behind=$BEHIND" >> "$GITHUB_OUTPUT"
+          echo "fork 落后上游 $BEHIND 个提交（候选 $CANDIDATE）"
+
+      # --------------------------------------------------------------------------
+      # S1 内容级检查（0 API 请求，全部基于已 fetch 的本地 git 数据）
+      # 防"代码清了扔个文本文件"：这种攻击历史延续、能 ff、仓库状态正常，
+      # 只有检查"内容本身是否被掏空"能拦住。
+      # --------------------------------------------------------------------------
+      - name: S1 内容检查（关键文件存在 / 删除断崖 / 总量腰斩）
+        if: steps.health.outputs.verdict == 'ok'
+        env:
+          CANDIDATE: ${{ steps.health.outputs.candidate_sha }}
+        run: |
+          set -euo pipefail
+          # ---- 规则 1：关键文件必须存在 ----
+          for f in $KEY_FILES; do
+            if ! git cat-file -e "${CANDIDATE}:${f}" 2>/dev/null; then
+              echo "::error::上游新版本缺少关键文件 $f（疑似代码被清空/掏空）。未做任何修改。"
+              exit 1
+            fi
+          done
+          # ---- 规则 2/3：删除断崖 + 总量腰斩 ----
+          TOTAL_NOW="$(git ls-tree -r --name-only "$CANDIDATE" | wc -l | tr -d ' ')"
+          DELETED="$(git diff --name-status HEAD.."$CANDIDATE" | grep -c '^D' || true)"
+          LAST="$(git notes --ref=upstream-sync show HEAD 2>/dev/null || true)"
+          LAST_COUNT="$(printf '%s\n' "$LAST" | sed -n 's/.*files=//p')"
+          echo "文件总数: $TOTAL_NOW（上次同步: ${LAST_COUNT:-无记录}），本次删除: $DELETED 个"
+          if [ "$DELETED" -gt "$MAX_DELETED_FILES" ]; then
+            echo "::error::本次更新删除 $DELETED 个文件，超过阈值 $MAX_DELETED_FILES。未做任何修改。"
+            exit 1
+          fi
+          if [ -n "$LAST_COUNT" ] && [ "$LAST_COUNT" -gt 0 ] 2>/dev/null; then
+            if [ $((TOTAL_NOW * 2)) -lt "$LAST_COUNT" ]; then
+              echo "::error::文件总数从 $LAST_COUNT 跌到 $TOTAL_NOW（腰斩）。未做任何修改。"
+              exit 1
+            fi
+            if [ $((DELETED * 100 / LAST_COUNT)) -gt "$MAX_DELETE_PCT" ]; then
+              echo "::error::删除比例 $((DELETED * 100 / LAST_COUNT))% 超过阈值 ${MAX_DELETE_PCT}%。未做任何修改。"
+              exit 1
+            fi
+          fi
+
+      - name: 写入运行摘要
+        if: always()
+        run: |
+          {
+            echo "### 上游状态门禁结果"
+            echo ""
+            echo "- 判定：\`${{ steps.health.outputs.verdict }}\`"
+            echo "- 原因：${{ steps.health.outputs.reason }}"
+            echo "- 候选提交：\`${{ steps.health.outputs.candidate_sha }}\`"
+            echo "- 检查明细：\`${{ steps.health.outputs.checks }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  apply:
+    name: 试合并 -> 正式合并 -> 构建验证 -> 推送
+    needs: check
+    if: needs.check.outputs.verdict == 'ok' && needs.check.outputs.behind != '0'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.FORK_BRANCH }}
+          fetch-depth: 0
+
+      - name: 拉取上游（含 tags）
+        run: |
+          git remote add upstream "https://github.com/${{ env.UPSTREAM_REPO }}.git"
+          git fetch --tags upstream "${{ env.UPSTREAM_BRANCH }}"
+
+      - name: 试合并检测冲突（不落盘、不推送）
+        id: trial
+        env:
+          CANDIDATE: ${{ needs.check.outputs.candidate_sha }}
+        run: |
+          set -euo pipefail
+          if git merge-base --is-ancestor HEAD "$CANDIDATE"; then
+            echo "mode=ff" >> "$GITHUB_OUTPUT"
+            echo "可 fast-forward（fork 无本地分叉提交）"
+            exit 0
+          fi
+          git merge --no-commit --no-ff "$CANDIDATE" >/dev/null 2>&1 || true
+          CONFLICTS="$(git diff --name-only --diff-filter=U || true)"
+          PROTECTED_HIT=""
+          for f in $CONFLICTS; do
+            for p in $PROTECTED_FILES; do
+              if [[ "$f" == "$p"* ]]; then PROTECTED_HIT="$PROTECTED_HIT $f"; fi
+            done
+          done
+          git merge --abort 2>/dev/null || true
+          echo "mode=merge" >> "$GITHUB_OUTPUT"
+          if [ -n "$CONFLICTS" ]; then
+            echo "::error::合并冲突：$CONFLICTS。其中受保护文件：${PROTECTED_HIT:-无}。已回滚，未推送。请人工合并后重跑本工作流，即恢复自动同步。"
+            exit 1
+          fi
+
+      - name: 受保护文件被上游改动检查（stricter 模式，可选）
+        if: env.BLOCK_ON_PROTECTED_CHANGE == 'true'
+        env:
+          CANDIDATE: ${{ needs.check.outputs.candidate_sha }}
+        run: |
+          set -euo pipefail
+          CHANGED="$(git diff --name-only HEAD "$CANDIDATE" -- $PROTECTED_FILES || true)"
+          if [ -n "$CHANGED" ]; then
+            echo "::error::上游改动了受保护文件：$CHANGED。BLOCK_ON_PROTECTED_CHANGE=true，已停止等人工确认。"
+            exit 1
+          fi
+
+      - name: 记录受保护文件差异（写入摘要用）
+        id: pdiff
+        env:
+          CANDIDATE: ${{ needs.check.outputs.candidate_sha }}
+        run: |
+          CHANGED="$(git diff --name-only HEAD "$CANDIDATE" -- $PROTECTED_FILES || true)"
+          echo "changed=${CHANGED//$'\n'/, }" >> "$GITHUB_OUTPUT"
+
+      - name: 正式合并（ff 优先；有本地提交则 merge，保留双方历史）
+        env:
+          CANDIDATE: ${{ needs.check.outputs.candidate_sha }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if [ "${{ steps.trial.outputs.mode }}" = "ff" ]; then
+            git merge --ff-only "$CANDIDATE"
+          else
+            git merge --no-ff "$CANDIDATE" -m "chore: auto-sync from ${{ env.UPSTREAM_REPO }}@$(git rev-parse --short "$CANDIDATE")"
+          fi
+
+      # 说明：不做本地 build 验证（不装依赖、不编译、不 dry-run）。
+      # 理由：上游 CI 已绿（S3）+ S1 内容检查 + git ff 历史完整性三重通过，
+      # 自己再 build 一遍是重复投入；CF 收到推送会自行构建，
+      # 真挂了在 CF 后台可见，回滚就是点一下旧版本部署。
+
+      - name: 推送到 fork（触发 Cloudflare 自动部署）
+        env:
+          SYNC_PAT: ${{ secrets.SYNC_PAT }}
+        run: |
+          set -euo pipefail
+          # 默认用 GITHUB_TOKEN 推送：不会触发本仓库其他 workflow（避免每次同步一个扫描红叉），
+          # 且会触发 Cloudflare Workers Builds 自动重建。
+          # 若实测 CF 未自动重建：创建 fine-grained PAT（仅本仓库 contents:write），
+          # 存为仓库 secret SYNC_PAT，本步骤会自动改用 PAT 推送。
+          if [ -n "$SYNC_PAT" ]; then
+            git push "https://x-access-token:${SYNC_PAT}@github.com/${{ github.repository }}.git" "HEAD:refs/heads/${{ env.FORK_BRANCH }}"
+          else
+            git push origin "HEAD:refs/heads/${{ env.FORK_BRANCH }}"
+          fi
+
+      - name: 记录同步状态（供下次检测上游历史改写 + 总量对比）
+        env:
+          CANDIDATE: ${{ needs.check.outputs.candidate_sha }}
+        run: |
+          set -euo pipefail
+          FILES_NOW="$(git ls-tree -r --name-only HEAD | wc -l | tr -d ' ')"
+          git notes --ref=upstream-sync add -f -m "$CANDIDATE files=$FILES_NOW"
+          git push --force origin "refs/notes/upstream-sync"
+
+      - name: 写入运行摘要
+        env:
+          PDIFF: ${{ steps.pdiff.outputs.changed }}
+        run: |
+          {
+            echo "### 上游自动同步完成"
+            echo ""
+            echo "- 上游：\`${{ env.UPSTREAM_REPO }}@${{ env.UPSTREAM_BRANCH }}\`"
+            echo "- 同步提交：\`${{ needs.check.outputs.candidate_sha }}\`"
+            echo "- 本次同步提交数：\`${{ needs.check.outputs.behind }}\`"
+            echo "- 受保护文件被上游改动：\`${PDIFF:-无}\`"
+            echo ""
+            echo "已推送 fork main，Cloudflare 将自动重新部署。部署后验证：JWT_SECRET(Secret) 仍在、绑定完整、客户端登录同步正常、备份中心正常。"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  notify:
+    name: 异常通知（开 Issue，绝不静默）
+    needs: [check, apply]
+    if: always() && (needs.check.result == 'failure' || needs.apply.result == 'failure' || needs.check.outputs.verdict == 'skip')
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+    steps:
+      - uses: actions/github-script@v7
+        with:
+          script: |
+            const runUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+            const needs_check_verdict = "${{ needs.check.outputs.verdict }}";
+            const needs_check_reason = "${{ needs.check.outputs.reason }}";
+            const skipped = needs_check_verdict === 'skip';
+            const title = skipped
+              ? "Upstream auto-sync 已暂停：上游状态异常，未同步"
+              : "Upstream auto-sync 失败，需要人工处理";
+            const q = `repo:${context.repo.owner}/${context.repo.repo} is:issue is:open in:title "${title}"`;
+            const { data } = await github.rest.search.issuesAndPullRequests({ q, per_page: 1 });
+            const lines = [
+              skipped
+                ? `按策略"上游状态正常才同步"，本次**未同步**，fork 保持原样，无需紧急处理。`
+                : `自动同步上游失败，**未对仓库做任何修改**。`,
+              ``,
+              `- 门禁判定：\`${needs_check_verdict}\``,
+              `- 原因：${needs_check_reason}`,
+              `- 运行日志：${runUrl}`,
+              ``,
+              `常见原因与处理：`,
+              `- 上游 CI 检查未通过 / 尚未跑完：等上游修复后会自动恢复同步；想立刻同步就手动 Run workflow`,
+              `- 上游删库 / 改名 / 归档 / 换默认分支：人工确认上游状态后，更新 UPSTREAM_REPO / UPSTREAM_BRANCH 再重跑`,
+              `- 上游历史被改写（force-push）：人工确认无恶意后，手动同步一次重置基线（会刷新 refs/notes/upstream-sync）`,
+              `- 合并冲突（尤其受保护文件 wrangler.toml / wrangler.kv.toml / .github/workflows/）：本地手动合并后重跑本工作流，即恢复自动同步`,
+              `- 构建失败：按日志修复，或等待上游修复后重跑`,
+            ];
+            const body = lines.join("\n");
+            if (data.total_count > 0) {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner, repo: context.repo.repo,
+                issue_number: data.items[0].number,
+                body: `再次发生：${runUrl}`,
+              });
+            } else {
+              await github.rest.issues.create({
+                owner: context.repo.owner, repo: context.repo.repo,
+                title, body,
+              });
+            }
