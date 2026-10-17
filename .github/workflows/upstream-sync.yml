@@ -374,6 +374,7 @@ jobs:
           CANDIDATE: ${{ needs.check.outputs.candidate_sha }}
         run: |
           set -euo pipefail
+          # shellcheck disable=SC2086 # PROTECTED_FILES 故意分词成多个 pathspec
           CHANGED="$(git diff --name-only HEAD "$CANDIDATE" -- $PROTECTED_FILES || true)"
           if [ -n "$CHANGED" ]; then
             echo "::error::上游改动了受保护文件：$CHANGED。BLOCK_ON_PROTECTED_CHANGE=true，已停止等人工确认。"
@@ -385,6 +386,7 @@ jobs:
         env:
           CANDIDATE: ${{ needs.check.outputs.candidate_sha }}
         run: |
+          # shellcheck disable=SC2086 # PROTECTED_FILES 故意分词成多个 pathspec
           CHANGED="$(git diff --name-only HEAD "$CANDIDATE" -- $PROTECTED_FILES || true)"
           echo "changed=${CHANGED//$'\n'/, }" >> "$GITHUB_OUTPUT"
 
